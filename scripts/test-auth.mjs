@@ -1,0 +1,23 @@
+import assert from 'node:assert/strict';
+import {readFile} from 'node:fs/promises';
+import {webcrypto,pbkdf2Sync,randomBytes} from 'node:crypto';
+if (!globalThis.crypto) Object.defineProperty(globalThis, "crypto", {value:webcrypto});
+const src=await readFile(new URL('../dist/server/index.js',import.meta.url),'utf8');
+const {default:worker}=await import('data:text/javascript;base64,'+Buffer.from(src).toString('base64'));
+const base='https://example.test',env={LOGIN_EMAIL:'fixture@example.test',LOGIN_SALT:randomBytes(16).toString('hex'),SESSION_KEY:randomBytes(32).toString('hex')};env.LOGIN_HASH=pbkdf2Sync('test-password',env.LOGIN_SALT,100000,32,'sha256').toString('hex');
+const get=(path,headers={})=>worker.fetch(new Request(base+path,{headers}),env);
+const post=(password,email='fixture@example.test',origin=base)=>worker.fetch(new Request(base+'/login',{method:'POST',headers:{Origin:origin,'Content-Type':'application/x-www-form-urlencoded','CF-Connecting-IP':'127.0.0.1'},body:new URLSearchParams({email,password})}),env);
+const initial=await get('/');assert.equal(initial.status,303);assert.equal(initial.headers.get('location'),'/login');
+const page=await get('/login');assert.equal(page.status,200);const html=await page.text();assert(html.includes('type="password"'));assert(!html.includes('id="commonForm"'));assert(!html.includes(env.LOGIN_HASH));
+for(const path of ['/api/config','/api/cases','/api/settings','/workspace.js','/exports.js','/twinkle.png','/app.js','/stars.js','/core.js','/style.css','/index.html','/worker/auth.js','/.env.example']){const r=await get(path);assert.notEqual(r.status,200);}
+assert.equal((await post('wrong')).status,401);assert.equal((await post('test-password','other@example.test')).status,401);assert.equal((await post('test-password',undefined,'https://evil.test')).status,403);
+const success=await post('test-password');assert.equal(success.status,303);const setCookie=success.headers.get('set-cookie');for(const flag of ['Secure','HttpOnly','SameSite=Lax','Max-Age=43200'])assert(setCookie.includes(flag));const cookie=setCookie.split(';')[0];
+const app=await get('/',{cookie});assert.equal(app.status,200);assert((await app.text()).includes('id="commonForm"'));assert.equal(app.headers.get('cache-control'),'no-store, private');assert.equal((await get('/core.js',{cookie})).status,200);
+assert.equal((await get('/',{cookie:cookie+'x'})).status,303);
+const signed= cookie.split('=')[1],parts=signed.split('.'),payload=JSON.parse(Buffer.from(parts[0],'base64url').toString());payload.exp=1;const tampered='__Host-complaint_session='+Buffer.from(JSON.stringify(payload)).toString('base64url')+'.'+parts[1];assert.equal((await get('/',{cookie:tampered})).status,303);
+const avatar=await get('/twinkle.png',{cookie});assert.equal(avatar.status,200);assert.equal(avatar.headers.get('content-type'),'image/png');assert.equal(new Uint8Array(await avatar.arrayBuffer())[0],137);
+const changed={...env,LOGIN_HASH:'changed'};assert.equal((await worker.fetch(new Request(base+'/',{headers:{cookie}}),changed)).status,303);
+const logout=await worker.fetch(new Request(base+'/logout',{method:'POST',headers:{Origin:base,cookie}}),env);assert.equal(logout.status,303);assert(logout.headers.get('set-cookie').includes('Max-Age=0'));
+assert.equal((await worker.fetch(new Request(base),{})).status,503);
+let last;for(let i=0;i<12;i++)last=await post('wrong');assert.equal(last.status,429);
+console.log('Authentication checks passed: protected assets, password verification, CSRF, signed cookies, tamper rejection, credential rotation, logout, missing secrets and rate limits.');
