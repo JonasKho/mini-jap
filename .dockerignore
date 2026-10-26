@@ -1,0 +1,12 @@
+.git
+node_modules
+**/node_modules
+.sites-runtime
+.wrangler
+dist
+**/runtime
+.env*
+**/.env*
+*.db
+**/*.db
+upload

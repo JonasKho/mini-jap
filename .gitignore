@@ -7,3 +7,7 @@ dist/
 *.db
 *.db-shm
 *.db-wal
+deploy/cloudbase/runtime/
+**/node_modules/
+**/.env
+**/.env.local

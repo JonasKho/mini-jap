@@ -1,0 +1,8 @@
+{
+  "name": "meilin-cloudbase-test",
+  "private": true,
+  "type": "module",
+  "engines": {"node": ">=24"},
+  "scripts": {"prepare-runtime": "node prepare.mjs", "start": "node server.mjs", "test": "node test.mjs"},
+  "dependencies": {"@cloudbase/node-sdk": "3.18.7"}
+}

@@ -1,0 +1,35 @@
+import{apiPayload,apiCanClose,apiSettings,apiReadJson,apiError,apiJson,apiText}from'./runtime/helpers.mjs';
+const statuses=new Set(['draft','notified','in_progress','verification','closed']);
+let dependencies;
+export function configureApi(value){dependencies=value;}
+const meta=r=>({id:r.id,customer:r.customer,orderNumber:r.orderNumber,product:r.product,status:r.status,version:r.version,createdAt:r.createdAt,updatedAt:r.updatedAt});
+function summary(p){const r=p.report||{},m=p.mail||{};return{issue:r.issueCategory||m.issue||'',internalDeadline:m.internalReplied?'':m.internalDeadline||'',customerDeadline:m.customerReplied?'':m.customerDeadline||'',timezone:m.timezone||'',owner:m.owner||'',reportTimezone:r.reportTimezone||m.timezone||'',actions:['containment','corrective','preventive'].map(k=>({kind:k,due:r[k+'Done']?'':r[k+'Due']||'',owner:r[k+'Owner']||''}))};}
+const result=r=>({id:r.id,version:r.version,status:r.status,createdAt:r.createdAt,updatedAt:r.updatedAt});
+const version=x=>Number.isSafeInteger(x)&&x>=0;
+export async function handleApi(req,env){
+ if(!dependencies)return apiError('国内记录服务尚未配置。',503);
+ const {store,storage}=dependencies,url=new URL(req.url),path=url.pathname,account=env.LOGIN_EMAIL.toLowerCase(),write=req.method!=='GET';
+ if(!['GET','POST','PUT'].includes(req.method))return apiError('不支持的操作。',405);
+ if(write&&req.headers.get('Origin')!==url.origin)return apiError('请求来源不正确。',403);
+ const upload=/^\/api\/cases\/[a-f0-9-]{36}\/evidence$/.test(path)&&req.method==='POST';
+ if(write&&!upload&&!req.headers.get('Content-Type')?.startsWith('application/json'))return apiError('请使用JSON请求。',415);
+ try{
+ if(path==='/api/config')return req.method==='GET'?apiJson({storageReady:true,evidenceReady:!!storage,translationReady:false,account}):apiError('不支持的操作。',405);
+ if(path==='/api/translate')return apiError('本测试版使用固定日语模板或人工译文，自动翻译尚未启用。',503);
+ if(path==='/api/settings'){if(!write)return apiJson(await store.getSettings(account));if(req.method!=='PUT')return apiError('不支持的操作。',405);const x=await apiReadJson(req);if(!version(x.version))return apiError('版本不正确。');const r=await store.saveSettings(account,x.version,apiSettings(x));return r?apiJson(r):apiError('词库已在其他窗口更新，请重新载入。',409);}
+ if(['/api/cases','/api/followup','/api/similar'].includes(path)&&!write){let rows=await store.listCases(account);rows.sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt)||b.id.localeCompare(a.id));
+ if(path==='/api/followup'){rows=rows.filter(r=>r.status!=='closed');return apiJson({items:rows.slice(0,500).map(r=>({...meta(r),...r.followup})),truncated:rows.length>500});}
+ if(path==='/api/similar'){const id=url.searchParams.get('id'),customer=url.searchParams.get('customer'),product=url.searchParams.get('product'),issue=url.searchParams.get('issue');return apiJson({items:rows.filter(r=>r.id!==id&&((customer&&r.customer===customer)||(product&&r.product===product))&&(!issue||r.followup?.issue===issue)).slice(0,10).map(meta)});}
+ const q=(url.searchParams.get('q')||'').slice(0,150).toLocaleLowerCase(),status=url.searchParams.get('status'),offset=Math.max(0,Math.min(1000,Math.floor(Number(url.searchParams.get('offset'))||0)));rows=rows.filter(r=>(!q||[r.customer,r.orderNumber,r.product].some(x=>x.toLocaleLowerCase().includes(q)))&&(!statuses.has(status)||r.status===status));return apiJson({items:rows.slice(offset,offset+50).map(meta),hasMore:rows.length>offset+50,nextOffset:offset+50});}
+ const match=path.match(/^\/api\/cases\/([a-f0-9-]{36})(?:\/(versions|evidence)(?:\/([a-f0-9-]{36}))?)?$/i);if(!match)return apiError('接口不存在。',404);const [,id,kind,fileId]=match,record=await store.getCase(id,account);
+ if(!kind){if(!write)return record?apiJson({...result(record),payload:record.payload}):apiError('未找到该记录。',404);if(req.method!=='PUT')return apiError('不支持的操作。',405);const x=await apiReadJson(req),payload=apiPayload(x.payload),status=statuses.has(x.status)?x.status:'draft';if(!version(x.version))return apiError('版本不正确。');if(status==='closed'&&!apiCanClose(payload))return apiError('尚不满足结案条件，请补全实际完成、验证和审核记录。',422);const r=await store.saveCase(id,account,x.version,{payload,status,customer:apiText(payload.common.customer,200),orderNumber:apiText(payload.common.order,150),product:apiText(payload.common.product,200),followup:summary(payload)});return r?apiJson(result(r)):apiError('该记录已在其他窗口更新，请另存副本。',409);}
+ if(!record)return apiError('未找到该案件。',404);
+ if(kind==='versions'){if(write)return apiError('版本记录只读。',405);return apiJson({items:await store.versions(id,account),note:'最近50次保存；姓名为自行填写。本测试环境与原网站的数据独立。'});}
+ if(!storage)return apiError('证据存储尚未配置。',503);
+ if(!write){if(fileId){const item=await store.getEvidence(fileId,account);if(!item||item.caseId!==id)return apiError('未找到文件。',404);const body=await storage.download(item.fileID);return new Response(body,{headers:{'Content-Type':item.type,'Content-Disposition':"attachment; filename*=UTF-8''"+encodeURIComponent(item.name),'Cache-Control':'no-store, private','X-Content-Type-Options':'nosniff'}});}const items=await store.listEvidence(id,account);return apiJson({items:items.map(({fileID,account,caseId,_id,...r})=>r)});}
+ if(!upload||fileId)return apiError('不支持的操作。',405);
+ if(Number(req.headers.get('Content-Length'))>8388608)return apiError('文件超过8 MB。',413);const reader=req.body?.getReader();if(!reader)return apiError('请选择文件。');let size=0;const chunks=[];for(;;){const part=await reader.read();if(part.done)break;size+=part.value.length;if(size>8388608){await reader.cancel();return apiError('文件超过8 MB。',413);}chunks.push(part.value);}const bytes=new Uint8Array(size);let at=0;for(const c of chunks){bytes.set(c,at);at+=c.length;}let type='';if(bytes[0]===255&&bytes[1]===216&&bytes[2]===255)type='image/jpeg';else if([137,80,78,71,13,10,26,10].every((n,i)=>bytes[i]===n))type='image/png';else if(new TextDecoder().decode(bytes.slice(0,4))==='RIFF'&&new TextDecoder().decode(bytes.slice(8,12))==='WEBP')type='image/webp';else if(new TextDecoder().decode(bytes.slice(0,5))==='%PDF-')type='application/pdf';if(!type)return apiError('仅支持JPG、PNG、WebP或PDF。',415);
+ if(!await store.reserveEvidence(id,account,1))return apiError('每案最多30份证据。',422);const key=crypto.randomUUID(),stage=['complaint','action','verification'].includes(url.searchParams.get('stage'))?url.searchParams.get('stage'):'complaint',name=apiText(url.searchParams.get('name'),180).replace(/[\/\\\x00-\x1f]/g,'_')||'证据文件';let fileID;
+ try{fileID=await storage.upload('meilin/'+id+'/'+key,bytes);await store.putEvidence({id:key,caseId:id,account,fileID,name,stage,type,size,uploaded:new Date().toISOString(),updatedAt:new Date().toISOString(),actor:apiText(url.searchParams.get('actor'),100)||'未填写'});}catch(e){await store.reserveEvidence(id,account,-1);if(fileID)await storage.remove(fileID).catch(()=>{});throw e;}return apiJson({id:key,name,stage},201);
+ }catch(e){if(e?.message==='large')return apiError('内容过长，请缩短后重试。',413);if(e instanceof SyntaxError||e?.message==='invalid')return apiError('数据格式不正确。',400);console.error('CloudBase operation failed',{code:typeof e?.code==='string'?e.code:'unknown'});return apiError('国内记录服务暂时异常，请保留页面并联系管理员检查环境配置。',500);}
+}
